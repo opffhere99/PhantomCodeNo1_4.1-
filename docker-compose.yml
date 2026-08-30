@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  c2-server:
+    image: php:8.2-apache
+    container_name: phantom-c2
+    user: "www-data"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./c2.php:/var/www/html/c2.php:ro
+      - ./config.php:/var/www/html/config.php:ro
+      - ./data:/var/www/html/data
+      - ./logs:/var/www/html/logs
+    environment:
+      - PHANTOM_DB_HOST=mysql
+      - PHANTOM_DB_NAME=phantom_c2
+      - PHANTOM_DB_USER=phantom_user
+      - PHANTOM_DB_PASS=${PHANTOM_DB_PASS:?Set in .env}
+      - PHANTOM_SECRET_KEY=${PHANTOM_SECRET_KEY:?Set in .env}
+    ports:
+      - "8080:80"
+    depends_on:
+      - mysql
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  mysql:
+    image: mysql:8.0
+    container_name: phantom-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set in .env}
+      MYSQL_DATABASE: phantom_c2
+      MYSQL_USER: phantom_user
+      MYSQL_PASSWORD: ${PHANTOM_DB_PASS:?Set in .env}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  mysql_data:
+
+networks:
+  backend:
+    internal: true
